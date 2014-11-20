@@ -1,0 +1,11 @@
+[package]
+
+name = "libaio"
+version = "0.0.1"
+authors = ["Jeremy Fitzhardinge <jeremy@goop.org>"]
+description = "Binding to Linux's async block IO syscalls and libaio"
+readme = "README.md"
+license = "MIT"
+
+[dependencies]
+eventfd="*"
