@@ -13,7 +13,10 @@ use std::os::unix::{AsRawFd, Fd};
 use super::FD;
 use aligned::AlignedBuf;
 
-pub struct DirectFile(FD, uint);
+pub struct DirectFile {
+    fd: FD,
+    alignment: uint,
+}
 
 const O_DIRECT: i32 = 0x4000;   // Linux
 
@@ -47,15 +50,14 @@ impl DirectFile {
         let path = path.to_c_str();
         match retry(|| unsafe { libc::open(path.as_ptr(), flags, mode) }) {
             -1 => Err(IoError::last_error()),
-            fd => Ok(DirectFile(FD(fd), alignment)),
+            fd => Ok(DirectFile { fd: FD(fd), alignment: alignment }),
         }
     }
 
-    pub fn alignment(&self) -> uint { let DirectFile(_, a) = *self; a }
+    pub fn alignment(&self) -> uint { self.alignment }
 
     pub fn pread(&self, buf: &mut AlignedBuf, off: u64) -> IoResult<uint> {
-        let DirectFile(fd, _) = *self;
-        let r = unsafe { ::libc::pread(fd.as_raw_fd(), buf.as_mut_ptr() as *mut c_void, buf.len() as u64, off as i64) };
+        let r = unsafe { ::libc::pread(self.fd.as_raw_fd(), buf.as_mut_ptr() as *mut c_void, buf.len() as u64, off as i64) };
 
         if r < 0 {
             Err(IoError::last_error())
@@ -65,8 +67,7 @@ impl DirectFile {
     }
 
     pub fn pwrite(&self, buf: &AlignedBuf, off: u64) -> IoResult<uint> {
-        let DirectFile(fd, _) = *self;
-        let r = unsafe { ::libc::pwrite(fd.as_raw_fd(), buf.as_slice().as_ptr() as *const c_void, buf.len() as u64, off as i64) };
+        let r = unsafe { ::libc::pwrite(self.fd.as_raw_fd(), buf.as_slice().as_ptr() as *const c_void, buf.len() as u64, off as i64) };
 
         if r < 0 {
             Err(IoError::last_error())
@@ -77,10 +78,7 @@ impl DirectFile {
 }
 
 impl AsRawFd for DirectFile {
-    fn as_raw_fd(&self) -> Fd {
-        let DirectFile(fd, _) = *self;
-        fd.as_raw_fd()
-    }
+    fn as_raw_fd(&self) -> Fd { self.fd.as_raw_fd() }
 }
 
 #[cfg(test)]
