@@ -37,7 +37,7 @@ pub struct Struct_iocb {
 impl Default for Struct_iocb {
     fn default() -> Struct_iocb {
         Struct_iocb { aio_lio_opcode: Iocmd::IO_CMD_NOOP as u16,
-                      aio_fildes: -1 as u32,
+                      aio_fildes: (-1_i32) as u32,
                       .. unsafe { zeroed() }
         }
     }
@@ -77,6 +77,9 @@ impl Default for Struct_io_event {
 pub enum Struct_io_context { }
 #[allow(non_camel_case_types)]
 pub type io_context_t = *mut Struct_io_context;
+
+//unsafe impl Send for *mut Struct_io_context {}
+//unsafe impl Send for *mut Struct_iocb {}
 
 #[repr(C)]
 pub struct Struct_iovec {

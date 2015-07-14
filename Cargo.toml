@@ -9,3 +9,8 @@ license = "MIT"
 
 [dependencies]
 eventfd="*"
+libc="*"
+chrono = "*"
+
+[dev-dependencies]
+tempdir = "*"

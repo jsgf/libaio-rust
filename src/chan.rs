@@ -4,32 +4,36 @@
 //! async results are returned through a result channel.
 extern crate std;
 
-use std::comm;
-use std::io::IoResult;
-use std::os::unix::AsRawFd;
+use std::sync::mpsc::{Sender,SyncSender,Receiver,channel,sync_channel};
+use std::io;
+use std::thread;
+use std::os::unix::io::AsRawFd;
+use std::boxed::FnBox;
 use buf::{RdBuf, WrBuf};
 
-use super::{FD, eagain};
+use super::{FD, Offset};
 use raw;
 
-/// Wrapper for a file offset.
-pub type Offset = u64;
+fn eagain() -> io::Error {
+    io::Error::from_raw_os_error(::libc::EAGAIN)
+}
 
 /// IO result.
 ///
-/// Each opreation returns an operation-specific value containing the
+/// Each operation returns an operation-specific value containing the
 /// resources used by the operations and the caller's token value `T`
 /// which ties the result to a specific request.
 ///
-/// The `IoResult<uint>` typically returns the number of bytes
+/// The `io::Result<usize>` typically returns the number of bytes
 /// read/written on success, or an `IoError` on failure.
-pub type IoRes<T, Wb, Rb> = (IoResult<uint>, raw::IoOp<T, Wb, Rb>);
+pub type IoRes<T, Wb, Rb> = (io::Result<usize>, raw::IoOp<T, Wb, Rb>);
 
 /// Submit a new IO operation.
 ///
 /// OpTx is the sender size of a channel for submitting new IO
 /// operations.
-type OpTx<T, Wb, Rb> = SyncSender<proc(ctx: &mut raw::Iocontext<T, Wb, Rb>, restx: &Sender<IoRes<T, Wb, Rb>>): Send>;
+type Callback<T, Wb, Rb> = Box<FnBox(&mut raw::Iocontext<T, Wb, Rb>, &Sender<IoRes<T, Wb, Rb>>)>;
+type OpTx<T, Wb, Rb> = SyncSender<Callback<T,Wb,Rb>>;
 
 /// Channel-based AIO context.
 ///
@@ -49,24 +53,18 @@ impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> Iocontext<T, Wb, Rb> {
     /// operations will block when there's max or more outstanding
     /// operations (batched and submitted). Returns the submission and
     /// results channel endpoints.
-    pub fn new(lowwater: uint, max: uint) -> IoResult<Iocontext<T, Wb, Rb>> {
+    pub fn new(lowwater: usize, max: usize) -> io::Result<Iocontext<T, Wb, Rb>> {
         assert!(lowwater > 0 && lowwater < max);
 
-        let mut ctx = match raw::Iocontext::new(max) {
-            Err(e) => return Err(e),
-            Ok(c) => c,
-        };
+        let mut ctx = try!(raw::Iocontext::new(max));
 
         // Prepare events
-        let evfd = match ctx.get_evfd_stream() {
-            Err(e) => return Err(e),
-            Ok(evfd) => evfd,
-        };
+        let evfd = try!(ctx.get_evfd_stream());
 
-        let (optx, oprx) = comm::sync_channel(max); // block requests when there are too many outstanding
-        let (restx, resrx) = comm::channel();       // don't block worker - there can't be more than requests anyway
+        let (optx, oprx) = sync_channel(max); // block requests when there are too many outstanding
+        let (restx, resrx) = channel();       // don't block worker - there can't be more than requests anyway
 
-        spawn(proc() {
+        thread::spawn(move || {
             let mut worker = ChanWorker { ctx: ctx, lowwater: lowwater };
             worker.worker(oprx, restx, evfd)
         });
@@ -85,7 +83,7 @@ impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> Iocontext<T, Wb, Rb> {
 
     /// Send a flush request. This causes all pending operations to be immediately submitted.
     pub fn flush(&self) {
-        self.optx.send(proc(ctx: &mut raw::Iocontext<T, Wb, Rb>, _: &Sender<IoRes<T, Wb, Rb>>) {
+        self.optx.send(move |ctx: &mut raw::Iocontext<T, Wb, Rb>, _: &Sender<IoRes<T, Wb, Rb>>| {
             match ctx.submit() {
                 Ok(_) => (),
                 Err(_) => (),
@@ -94,10 +92,10 @@ impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> Iocontext<T, Wb, Rb> {
     }
 
     fn sendhelper<F: AsRawFd>(&self, file: &F,
-                              func: proc(ctx: &mut raw::Iocontext<T, Wb, Rb>, file: FD):Send -> Result<(), raw::IoOp<T, Wb, Rb>>) {
+                              func: FnBox(&mut raw::Iocontext<T, Wb, Rb>, FD) -> Result<(), raw::IoOp<T, Wb, Rb>>) {
         let fd = FD::new(file);
 
-        self.optx.send(proc(ctx: &mut raw::Iocontext<T, Wb, Rb>, restx: &Sender<IoRes<T, Wb, Rb>>) {
+        self.optx.send(move |ctx: &mut raw::Iocontext<T, Wb, Rb>, restx: &Sender<IoRes<T, Wb, Rb>>| {
             match func(ctx, fd) {
                 Ok(_) => (),
                 Err(r) => restx.send((Err(eagain()), r))
@@ -107,10 +105,10 @@ impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> Iocontext<T, Wb, Rb> {
 
     /// Send a Pread request.
     ///
-    /// On success, the returned uint indicates how much of `buf` was
+    /// On success, the returned usize indicates how much of `buf` was
     /// initialized. Otherwise on error, none of it will have been.
     pub fn pread<F: AsRawFd>(&self, file: &F, buf: Rb, off: Offset, tok: T) {
-        self.sendhelper(file, proc(ctx, f) {
+        self.sendhelper(file, move |ctx, f| {
             ctx.pread(&f, buf, off, tok).map_err(|(buf, tok)| raw::IoOp::Pread(buf, tok))
         })
     }
@@ -119,35 +117,35 @@ impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> Iocontext<T, Wb, Rb> {
     ///
     /// On success, data is read into each element of `bufv` in turn.
     pub fn preadv<F: AsRawFd>(&self, file: &F, bufv: Vec<Rb>, off: Offset, tok: T) {
-        self.sendhelper(file, proc(ctx, f) {
+        self.sendhelper(file, move |ctx, f| {
             ctx.preadv(&f, bufv, off, tok).map_err(|(bufv, tok)| raw::IoOp::Preadv(bufv, tok))
         })
     }
 
     /// Send a Pwrite request.
     pub fn pwrite<F: AsRawFd>(&self, file: &F, buf: Wb, off: Offset, tok: T) {
-        self.sendhelper(file, proc(ctx, f) {
+        self.sendhelper(file, move |ctx, f| {
             ctx.pwrite(&f, buf, off, tok).map_err(|(buf, tok)| raw::IoOp::Pwrite(buf, tok))
         })
     }
 
     /// Send a Pwritev request.
     pub fn pwritev<F: AsRawFd>(&self, file: &F, bufv: Vec<Wb>, off: Offset, tok: T) {
-        self.sendhelper(file, proc(ctx, f) {
+        self.sendhelper(file, move |ctx, f| {
             ctx.pwritev(&f, bufv, off, tok).map_err(|(bufv, tok)| raw::IoOp::Pwritev(bufv, tok))
         })
     }
 
     /// Send a Fsync request.
     pub fn fsync<F: AsRawFd>(&self, file: &F, tok: T) {
-        self.sendhelper(file, proc(ctx, f) {
+        self.sendhelper(file, move |ctx, f| {
             ctx.fsync(&f, tok).map_err(|tok| raw::IoOp::Fsync(tok))
         })
     }
 
     /// Send a Fdsync request.
     pub fn fdsync<F: AsRawFd>(&self, file: &F, tok: T) {
-        self.sendhelper(file, proc(ctx, f) {
+        self.sendhelper(file, move | ctx, f| {
             ctx.fdsync(&f, tok).map_err(|tok| raw::IoOp::Fdsync(tok))
         })
     }
@@ -156,7 +154,7 @@ impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> Iocontext<T, Wb, Rb> {
 struct ChanWorker<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> {
     ctx: raw::Iocontext<T, Wb, Rb>,
 
-    lowwater: uint,
+    lowwater: usize,
 }
 
 impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> ChanWorker<T, Wb, Rb> {
@@ -167,7 +165,7 @@ impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> ChanWorker<T, Wb, Rb> {
 
         let max = self.ctx.maxops();
         match self.ctx.results(1, max, None) {
-            Err(e) => panic!("get results failed {}", e),
+            Err(e) => panic!("get results failed {:?}", e),
             Ok(v) =>
                 for s in v.into_iter().map(|(op, res)| (res, op)) {
                     restx.send(s)
@@ -177,13 +175,13 @@ impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> ChanWorker<T, Wb, Rb> {
 
     fn submit(&mut self) {
         match self.ctx.submit() {
-            Err(e) => panic!("submit failed {}", e),
+            Err(e) => panic!("submit failed {:?}", e),
             Ok(_) => (),
         }
     }
 
     fn worker(&mut self,
-              oprx: Receiver<proc(&mut raw::Iocontext<T, Wb, Rb>, &Sender<IoRes<T, Wb, Rb>>): Send>,
+              oprx: Receiver<FnBox(&mut raw::Iocontext<T, Wb, Rb>, &Sender<IoRes<T, Wb, Rb>>)>,
               restx: Sender<IoRes<T, Wb, Rb>>,
               evfd: Receiver<u64>) {
         let mut closed = false;
@@ -215,22 +213,29 @@ impl<T : Send, Wb : WrBuf + Send, Rb : RdBuf + Send> ChanWorker<T, Wb, Rb> {
 
 #[cfg(test)]
 mod test {
+    extern crate tempdir;
+
+    use self::tempdir::TempDir;
+    use std::fs::{File,OpenOptions};
     use super::Iocontext;
-    use std::io::{TempDir, File, Truncate, ReadWrite};
 
     fn tmpfile(name: &str) -> File {
         let tmp = TempDir::new("test").unwrap();
-        let mut path = tmp.path().clone();
+        let mut path = tmp.into_path();
 
         path.push(name);
-        File::open_mode(&path, Truncate, ReadWrite).unwrap()
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path).unwrap()
     }
-
 
     #[test]
     fn simple() {
         let io = match Iocontext::new(5, 10) {
-            Err(e) => panic!("new failed {}", e),
+            Err(e) => panic!("new failed {:?}", e),
             Ok(t) => t,
         };
         let file = tmpfile("chan");
@@ -244,7 +249,7 @@ mod test {
         io.flush();
 
         for (res, op) in res.iter().take(2) {
-            println!("res {} op {}", res, op);
+            println!("res {:?} op {:?}", res, op);
         }
     }
 }

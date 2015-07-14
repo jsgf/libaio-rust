@@ -13,16 +13,16 @@ use buf::{RdBuf, WrBuf};
 /// the alignment, and the number of valid (initialized) bytes.
 pub struct AlignedBuf {
     buf: *mut u8,               // pointer to allocated memory
-    align: uint,                // alignment of buffer
-    len: uint,                  // length of allocated memory
-    valid: uint,                // length of valid/initialized memory
+    align: usize,               // alignment of buffer
+    len: usize,                 // length of allocated memory
+    valid: usize,               // length of valid/initialized memory
 }
 
-fn ispower2(n: uint) -> bool {
+fn ispower2(n: usize) -> bool {
     (n & (n - 1)) == 0
 }
 
-unsafe fn realloc(ptr: *mut u8, oldsz: uint, sz: uint, align: uint) -> *mut u8 {
+unsafe fn realloc(ptr: *mut u8, oldsz: usize, sz: usize, align: usize) -> *mut u8 {
     if heap::reallocate_inplace(ptr, oldsz, sz, align) >= sz {
         ptr
     } else {
@@ -36,7 +36,7 @@ impl AlignedBuf {
     ///
     /// # Preconditions
     /// `align` must be a power of 2, and greater than 0.
-    pub unsafe fn alloc_uninit(size: uint, align: uint) -> Option<AlignedBuf> {
+    pub unsafe fn alloc_uninit(size: usize, align: usize) -> Option<AlignedBuf> {
         assert!(align > 0);
         assert!(ispower2(align));
 
@@ -53,29 +53,29 @@ impl AlignedBuf {
     }
 
     /// Allocate a buffer initialized to bytes.
-    pub fn alloc(size: uint, align: uint) -> Option<AlignedBuf> {
+    pub fn alloc(size: usize, align: usize) -> Option<AlignedBuf> {
         unsafe {
             match AlignedBuf::alloc_uninit(size, align) {
                 None => None,
                 Some(mut b) => {
-                    ptr::zero_memory(b.buf, b.len);
+                    ptr::write_bytes(b.buf, 0, b.len);
                     b.valid = b.len;
                     Some(b)
-                },
+                }
             }
         }
     }
 
     /// Allocate a buffer and initialize it from a slice.
-    pub fn from_slice(data: &[u8], align: uint) -> Option<AlignedBuf> {
+    pub fn from_slice(data: &[u8], align: usize) -> Option<AlignedBuf> {
         unsafe {
             match AlignedBuf::alloc_uninit(data.len(), align) {
                 None => None,
                 Some(mut b) => {
-                    ptr::copy_nonoverlapping_memory(b.buf, data.as_ptr(), data.len());
+                    ptr::copy_nonoverlapping(data.as_ptr(), b.buf, data.len());
                     if data.len() != b.len {
                         assert!(b.len > data.len());
-                        ptr::zero_memory((b.buf as uint + data.len()) as *mut u8, b.len - data.len())
+                        ptr::write_bytes((b.buf as usize + data.len()) as *mut u8, 0, b.len - data.len())
                     };
                     b.valid = b.len;
                     Some(b)
@@ -87,7 +87,7 @@ impl AlignedBuf {
     /// Extend a buffer to `size` bytes, leaving the added storage
     /// uninitialized. Returns false if the allocation fails. `size`
     /// is rounded up to the alignment.
-    pub unsafe fn extend_uninit(&mut self, size: uint) -> bool {
+    pub unsafe fn extend_uninit(&mut self, size: usize) -> bool {
         let sz = (size + self.align - 1) & (self.align - 1);
 
         assert!(sz >= self.len);
@@ -109,14 +109,14 @@ impl AlignedBuf {
     /// Extend a buffer to `size` bytes, initializing the new storage
     /// to 0s. `size` is rounded up to the alignment. Returns false if
     /// the allocation failed.
-    pub fn extend(&mut self, size: uint) -> bool {
+    pub fn extend(&mut self, size: usize) -> bool {
         let origsz = self.len;
 
         unsafe {
             let ok = self.extend_uninit(size);
 
             if ok && self.len > origsz {
-                ptr::zero_memory((self.buf as uint + origsz) as *mut u8, self.len - origsz);
+                ptr::write_bytes((self.buf as usize + origsz) as *mut u8, 0, self.len - origsz);
                 self.valid = self.len
             };
 
@@ -125,7 +125,7 @@ impl AlignedBuf {
     }
 
     /// Shrink a buffer. `size` is rounded up to the alignment.
-    pub fn shrink(&mut self, size: uint) -> bool {
+    pub fn shrink(&mut self, size: usize) -> bool {
         let sz = (size + self.align - 1) & (self.align - 1);
         assert!(sz <= self.len);
 
@@ -143,6 +143,8 @@ impl AlignedBuf {
         }
     }
 
+    pub fn as_slice(&self) -> &[u8] { self.wrbuf() }
+    
     pub unsafe fn as_ptr(&self) -> *const u8 {
         self.buf as *const u8
     }
@@ -151,20 +153,13 @@ impl AlignedBuf {
         self.buf
     }
 
-    pub fn len(&self) -> uint { self.len }
-    pub fn valid(&self) -> uint { self.valid }
+    pub fn len(&self) -> usize { self.len }
+    pub fn valid(&self) -> usize { self.valid }
 }
 
 impl Drop for AlignedBuf {
     fn drop(&mut self) {
         unsafe { heap::deallocate(self.buf, self.len, self.align) }
-    }
-}
-
-impl AsSlice<u8> for AlignedBuf {
-    /// Returns a slice of the valid portion of the buffer.
-    fn as_slice(&self) -> &[u8] {
-        self.wrbuf()
     }
 }
 
@@ -179,7 +174,7 @@ impl Clone for AlignedBuf {
                 None => panic!("clone failed"),
                 Some(mut b) => {
                     if b.valid > 0 {
-                        ptr::copy_nonoverlapping_memory(b.buf, self.buf as *const u8, b.valid);
+                        ptr::copy_nonoverlapping(self.buf as *const u8, b.buf, b.valid);
                         b.valid = self.valid
                     };
                     b
@@ -194,11 +189,11 @@ impl RdBuf for AlignedBuf {
     /// initialized, and so should be treated as write-only.
     fn rdbuf<'a>(&'a mut self) -> &'a mut [u8] {
         assert!(self.valid <= self.len);
-        unsafe { slice::from_raw_mut_buf(&self.buf, self.len) }
+        unsafe { slice::from_raw_parts_mut(self.buf, self.len) }
     }
 
     /// Update the valid portion of the buffer.
-    fn rdupdate(&mut self, base: uint, len: uint) {
+    fn rdupdate(&mut self, base: usize, len: usize) {
         assert!(self.valid <= self.len);
         if base <= self.valid && base+len > self.valid {
             assert!(base+len <= self.len);
@@ -211,7 +206,7 @@ impl WrBuf for AlignedBuf {
     /// Return a read-only slice of the valid portion of the buffer.
     fn wrbuf<'a>(&'a self) -> &'a [u8] {
         assert!(self.valid <= self.len);
-        unsafe { slice::from_raw_mut_buf(&self.buf, self.valid) }
+        unsafe { slice::from_raw_parts_mut(self.buf, self.valid) }
     }
 }
 
@@ -219,7 +214,7 @@ impl WrBuf for AlignedBuf {
 mod test {
     use super::AlignedBuf;
 
-    fn alloc(size: uint, align: uint) -> AlignedBuf {
+    fn alloc(size: usize, align: usize) -> AlignedBuf {
         match AlignedBuf::alloc(size, align) {
             None => panic!("alloc failed"),
             Some(p) => p,

@@ -5,7 +5,7 @@ extern crate std;
 
 use std::comm;
 use std::sync::Future;
-use std::io::IoResult;
+use std::io;
 use std::os::unix::AsRawFd;
 
 use buf::{RdBuf, WrBuf};
@@ -14,11 +14,11 @@ use raw::IoOp;
 use super::eagain;
 
 enum IoFut<Wb: WrBuf, Rb: RdBuf> {
-    Pread(SyncSender<(IoResult<uint>, Rb)>),
-    Preadv(SyncSender<(IoResult<uint>, Vec<Rb>)>),
-    Pwrite(SyncSender<(IoResult<uint>, Wb)>),
-    Pwritev(SyncSender<(IoResult<uint>, Vec<Wb>)>),
-    Fsync(SyncSender<IoResult<()>>),
+    Pread(SyncSender<(io::Result<uint>, Rb)>),
+    Preadv(SyncSender<(io::Result<uint>, Vec<Rb>)>),
+    Pwrite(SyncSender<(io::Result<uint>, Wb)>),
+    Pwritev(SyncSender<(io::Result<uint>, Vec<Wb>)>),
+    Fsync(SyncSender<io::Result<()>>),
 }
 
 type RawIoctx<Wb, Rb> = raw::Iocontext<IoFut<Wb, Rb>, Wb, Rb>;
@@ -29,7 +29,7 @@ pub struct Iocontext<Wb: WrBuf + Send, Rb: RdBuf + Send> {
 
 impl<Wb: WrBuf + Send, Rb: RdBuf + Send> Iocontext<Wb, Rb> {
     /// Construct a new Iocontext.
-    pub fn new(max: uint) -> IoResult<Iocontext<Wb, Rb>> {
+    pub fn new(max: uint) -> io::Result<Iocontext<Wb, Rb>> {
         Ok(Iocontext { ctx: try!(raw::Iocontext::new(max)) })
     }
 
@@ -63,7 +63,7 @@ impl<Wb: WrBuf + Send, Rb: RdBuf + Send> Iocontext<Wb, Rb> {
     }
 
     /// Submit all pending IO operations.
-    pub fn flush(&mut self) -> IoResult<()> {
+    pub fn flush(&mut self) -> io::Result<()> {
         match self.ctx.submit() {
             Err(e) => return Err(e),
             Ok(_) => (),
@@ -77,7 +77,7 @@ impl<Wb: WrBuf + Send, Rb: RdBuf + Send> Iocontext<Wb, Rb> {
     }
 
     /// Submit a pread operation.
-    pub fn pread<F: AsRawFd>(&mut self, file: &F, buf: Rb, off: u64) -> Future<(IoResult<uint>, Rb)> {
+    pub fn pread<F: AsRawFd>(&mut self, file: &F, buf: Rb, off: u64) -> Future<(io::Result<uint>, Rb)> {
         let (tx, rx) = comm::sync_channel(1);
 
         match self.ctx.pread(file, buf, off, IoFut::Pread(tx)) {
@@ -87,7 +87,7 @@ impl<Wb: WrBuf + Send, Rb: RdBuf + Send> Iocontext<Wb, Rb> {
     }
 
     /// Submit a preadv operation.
-    pub fn preadv<F: AsRawFd>(&mut self, file: &F, bufv: Vec<Rb>, off: u64) -> Future<(IoResult<uint>, Vec<Rb>)> {
+    pub fn preadv<F: AsRawFd>(&mut self, file: &F, bufv: Vec<Rb>, off: u64) -> Future<(io::Result<uint>, Vec<Rb>)> {
         let (tx, rx) = comm::sync_channel(1);
 
         match self.ctx.preadv(file, bufv, off, IoFut::Preadv(tx)) {
@@ -97,7 +97,7 @@ impl<Wb: WrBuf + Send, Rb: RdBuf + Send> Iocontext<Wb, Rb> {
     }
 
     /// Submit a pwrite operation.
-    pub fn pwrite<F: AsRawFd>(&mut self, file: &F, buf: Wb, off: u64) -> Future<(IoResult<uint>, Wb)> {
+    pub fn pwrite<F: AsRawFd>(&mut self, file: &F, buf: Wb, off: u64) -> Future<(io::Result<uint>, Wb)> {
         let (tx, rx) = comm::sync_channel(1);
 
         match self.ctx.pwrite(file, buf, off, IoFut::Pwrite(tx)) {
@@ -107,7 +107,7 @@ impl<Wb: WrBuf + Send, Rb: RdBuf + Send> Iocontext<Wb, Rb> {
     }
 
     /// Submit a pwritev operation.
-    pub fn pwritev<F: AsRawFd>(&mut self, file: &F, bufv: Vec<Wb>, off: u64) -> Future<(IoResult<uint>, Vec<Wb>)> {
+    pub fn pwritev<F: AsRawFd>(&mut self, file: &F, bufv: Vec<Wb>, off: u64) -> Future<(io::Result<uint>, Vec<Wb>)> {
         let (tx, rx) = comm::sync_channel(1);
 
         match self.ctx.pwritev(file, bufv, off, IoFut::Pwritev(tx)) {
@@ -117,7 +117,7 @@ impl<Wb: WrBuf + Send, Rb: RdBuf + Send> Iocontext<Wb, Rb> {
     }
 
     /// Submit an fsync.
-    pub fn fsync<F: AsRawFd>(&mut self, file: &F) -> Future<IoResult<()>> {
+    pub fn fsync<F: AsRawFd>(&mut self, file: &F) -> Future<io::Result<()>> {
         let (tx, rx) = comm::sync_channel(1);
 
         match self.ctx.fsync(file, IoFut::Fsync(tx)) {
@@ -127,7 +127,7 @@ impl<Wb: WrBuf + Send, Rb: RdBuf + Send> Iocontext<Wb, Rb> {
     }
 
     /// Submit an fdatasync.
-    pub fn fdsync<F: AsRawFd>(&mut self, file: &F) -> Future<IoResult<()>> {
+    pub fn fdsync<F: AsRawFd>(&mut self, file: &F) -> Future<io::Result<()>> {
         let (tx, rx) = comm::sync_channel(1);
 
         match self.ctx.fdsync(file, IoFut::Fsync(tx)) {

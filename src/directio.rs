@@ -4,36 +4,48 @@ extern crate libc;
 
 use libc::{c_void};
 
-use std::num::{Int, SignedInt};
 use std::path::Path;
-use std::io::{FileMode, FileAccess};
-use std::io::{IoResult, IoError, Open, Append, Truncate, Read, Write, ReadWrite};
-use std::os::unix::{AsRawFd, Fd};
+use std::os::unix::io::{AsRawFd, RawFd};
+use std::io;
+use directio::Mode::*;
+use directio::FileAccess::*;
 
 use super::FD;
 use aligned::AlignedBuf;
 
 pub struct DirectFile {
     fd: FD,
-    alignment: uint,
+    alignment: usize,
 }
 
 const O_DIRECT: i32 = 0x4000;   // Linux
 
 #[inline]
-fn retry<T: SignedInt> (f: || -> T) -> T {
-    let one: T = Int::one();
+fn retry<F: Fn() -> isize>(f: F) -> isize {
     loop {
         let n = f();
-        if n == -one && std::os::errno() == libc::EINTR as uint { }
-        else { return n }
+        if n != -1 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return n
+        }
     }
+}
+
+pub enum Mode {
+    Open,
+    Append,
+    Truncate,
+}
+
+pub enum FileAccess {
+    Read,
+    Write,
+    ReadWrite,
 }
 
 impl DirectFile {
     // XXX auto-query directio alignment
-    pub fn open(path: &Path, fm: FileMode, fa: FileAccess, alignment: uint) -> IoResult<DirectFile> {
-        let flags = O_DIRECT | match fm {
+    pub fn open<P: AsRef<Path>>(path: P, mode: Mode, fa: FileAccess, alignment: usize) -> io::Result<DirectFile> {
+        let flags = O_DIRECT | match mode {
             Open => 0,
             Append => libc::O_APPEND,
             Truncate => libc::O_TRUNC,
@@ -47,62 +59,67 @@ impl DirectFile {
                           libc::S_IRUSR | libc::S_IWUSR),
         };
 
-        let path = path.to_c_str();
-        match retry(|| unsafe { libc::open(path.as_ptr(), flags, mode) }) {
-            -1 => Err(IoError::last_error()),
-            fd => Ok(DirectFile { fd: FD(fd), alignment: alignment }),
+        let path = path.as_ref().as_os_str().to_bytes().unwrap();
+        match retry(|| unsafe { libc::open(path.as_ptr() as *const i8, flags, mode) as isize }) {
+            -1 => Err(io::Error::last_os_error()),
+            fd => Ok(DirectFile { fd: FD(fd as i32), alignment: alignment }),
         }
     }
 
-    pub fn alignment(&self) -> uint { self.alignment }
+    pub fn alignment(&self) -> usize { self.alignment }
 
-    pub fn pread(&self, buf: &mut AlignedBuf, off: u64) -> IoResult<uint> {
+    pub fn pread(&self, buf: &mut AlignedBuf, off: u64) -> io::Result<usize> {
         let r = unsafe { ::libc::pread(self.fd.as_raw_fd(), buf.as_mut_ptr() as *mut c_void, buf.len() as u64, off as i64) };
 
         if r < 0 {
-            Err(IoError::last_error())
+            Err(io::Error::last_os_error())
         } else {
-            Ok(r as uint)
+            Ok(r as usize)
         }
     }
 
-    pub fn pwrite(&self, buf: &AlignedBuf, off: u64) -> IoResult<uint> {
-        let r = unsafe { ::libc::pwrite(self.fd.as_raw_fd(), buf.as_slice().as_ptr() as *const c_void, buf.len() as u64, off as i64) };
+    pub fn pwrite(&self, buf: &AlignedBuf, off: u64) -> io::Result<usize> {
+        let r = unsafe {
+            ::libc::pwrite(self.fd.as_raw_fd(),
+                           buf.as_ptr() as *const c_void,
+                           buf.len() as u64,
+                           off as i64) };
 
         if r < 0 {
-            Err(IoError::last_error())
+            Err(io::Error::last_os_error())
         } else {
-            Ok(r as uint)
+            Ok(r as usize)
         }
     }
 }
 
 impl AsRawFd for DirectFile {
-    fn as_raw_fd(&self) -> Fd { self.fd.as_raw_fd() }
+    fn as_raw_fd(&self) -> RawFd { self.fd.as_raw_fd() }
 }
 
 #[cfg(test)]
 mod test {
-    use std::io::{TempDir, Truncate, ReadWrite};
+    extern crate tempdir;
+    
     use std::path::Path;
     use super::DirectFile;
+    use super::Mode::*;
+    use super::FileAccess::*;
     use aligned::AlignedBuf;
+    use self::tempdir::TempDir;
     
     fn tmpfile(name: &str) -> DirectFile {
         let tmp = TempDir::new_in(&Path::new("."), "test").unwrap();
-        let mut path = tmp.path().clone();
+        let mut path = tmp.into_path();
 
         path.push(name);
-        match DirectFile::open(&path, Truncate, ReadWrite, 4096) {
-            Err(e) => panic!("open failed {}", e),
-            Ok(f) => f
-        }
+        DirectFile::open(&path, Truncate, ReadWrite, 4096).unwrap()
     }
 
     #[test]
     fn simple() {
         let file = tmpfile("direct");
-        let data = match AlignedBuf::from_slice(['x' as u8, ..4096].as_slice(), 4096) {
+        let data = match AlignedBuf::from_slice(&['x' as u8; 4096][..], 4096) {
             None => panic!("buf alloc"),
             Some(b) => b
         };
